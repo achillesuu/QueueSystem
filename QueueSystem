@@ -1,0 +1,564 @@
+-- Discord: @okk26 | Roblox: @Achillesuu
+
+-- Queue system for lobby matchmaking + teleporting players into private servers
+-- Handles zone detection, loadout checks, countdowns, and map selection per queue
+-- Each queue model in workspace runs independently
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TeleportService = game:GetService("TeleportService")
+
+local remotesFolder = ReplicatedStorage:WaitForChild("PhysicalQueuesRemotes")
+local RE_State = remotesFolder:WaitForChild("QueueState")
+local RE_Leave = remotesFolder:WaitForChild("LeaveQueue")
+
+local QueuesFolder = workspace:WaitForChild("Map").Queues
+
+-- Default countdown based on the queue size
+local DefaultTimeByMax = {
+	[1] = 5,
+	[2] = 10,
+	[3] = 20,
+	[4] = 30
+}
+
+-- Keeps the queue updated without checking every frame
+local scanInterval = 0.2
+
+local showGeneralText = ReplicatedStorage.Remotes:WaitForChild("ShowGeneralText")
+
+-- Players need all 6 slots filled before they can queue
+local function hasValidLoadout(player)
+	local equipped = player:FindFirstChild("EquippedUnits")
+	if not equipped then
+		return false
+	end
+
+	for i = 1, 6 do
+		local slot = equipped:FindFirstChild("Slot" .. i)
+
+		if not slot or slot.Value == "" then
+			return false
+		end
+	end
+
+	return true
+end
+
+local function readValueNumber(queueModel, name)
+	local v = queueModel:FindFirstChild(name)
+	if not v then
+		return nil
+	end
+	if v:IsA("IntValue") or v:IsA("NumberValue") then
+		return v.Value
+	end
+	return nil
+end
+
+local function getMaxPlayers(queueModel)
+	local v = readValueNumber(queueModel, "MaxPlayers")
+	if typeof(v) == "number" and v > 0 then
+		return math.floor(v)
+	end
+	return 1
+end
+
+local function getMinPlayers(queueModel, maxPlayers)
+	local v = readValueNumber(queueModel, "MinPlayers")
+	if typeof(v) == "number" and v > 0 then
+		return math.floor(v)
+	end
+	return math.max(1, maxPlayers)
+end
+
+local function getMapPool(queueModel)
+	local folder = queueModel:FindFirstChild("MapPool")
+	if not folder then return nil end
+
+	local maps = {}
+
+	for _, v in ipairs(folder:GetChildren()) do
+		if v:IsA("IntValue") or v:IsA("NumberValue") then
+			table.insert(maps, v)
+			-- Keep the value object so we can still use its name and image
+		end
+	end
+
+	return maps
+end
+
+local function pickRandomMap(queueModel)
+	local maps = getMapPool(queueModel)
+	if not maps or #maps == 0 then
+		return nil
+	end
+
+	return maps[math.random(1, #maps)]
+end
+
+local function setMapImage(queueModel, selectedMap)
+	local displayPart = queueModel:FindFirstChild("DisplayPart")
+	if not displayPart then return end
+
+	local billboard = displayPart:FindFirstChild("BillboardGui")
+	if not billboard then return end
+
+	local imageLabel = billboard:FindFirstChild("ImageLabel")
+	if not imageLabel then return end
+
+	if selectedMap then
+		local imageId = selectedMap:FindFirstChild("ImageId")
+
+		if imageId then
+			imageLabel.Image = imageId.Value
+		end
+	end
+end
+
+-- More reliable than Touched for checking who's actually inside
+local function pointInsidePart(part, worldPoint)
+	local p = part.CFrame:PointToObjectSpace(worldPoint)
+	local half = part.Size * 0.5
+	return math.abs(p.X) <= half.X and math.abs(p.Y) <= half.Y and math.abs(p.Z) <= half.Z
+end
+
+local function setDisplay(queueModel, text)
+	local displayPart = queueModel:FindFirstChild("DisplayPart")
+	if not displayPart then return end
+	local bb = displayPart:FindFirstChild("BillboardGui")
+	if not bb then return end
+	local label = bb:FindFirstChild("TextLabel")
+	if not (label and label:IsA("TextLabel")) then return end
+	label.Text = text
+end
+
+-- Safely moves a player to a position without breaking their character
+-- Uses PivotTo instead of manually setting CFrame
+local function safePivotTo(player, cf)
+	local char = player.Character
+	if not char then return end
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return end
+	char:PivotTo(cf)
+end
+
+-- Stores everything that changes while the server is running
+local QueueStates = {}
+
+-- Sets up a queue when the server starts or when a new queue is added
+-- Basically just prepares its internal data so it can start tracking players
+local function initQueue(queueModel)
+	QueueStates[queueModel] = {
+		members = {},
+		countdown = nil,
+		selectedMap = nil,
+		teleporting = false,
+		teleportingPlayers = {},
+	}
+end
+
+for _, q in ipairs(QueuesFolder:GetChildren()) do
+	if q:IsA("Model") then initQueue(q) end
+end
+
+QueuesFolder.ChildAdded:Connect(function(child)
+	if child:IsA("Model") then initQueue(child) end
+end)
+
+local function broadcastPlayerQueue(player, queueNameOrNil)
+	RE_State:FireClient(player, queueNameOrNil)
+end
+
+local function countMembers(state)
+	local n = 0
+	for _ in pairs(state.members) do n += 1 end
+	return n
+end
+
+-- Gets all players currently standing inside a zone part
+-- Used for automatically adding or removing players from queues
+local function getPlayersInZone(zonePart)
+	local list = {}
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local char = plr.Character
+		if char then
+			local hrp = char:FindFirstChild("HumanoidRootPart")
+			if hrp and pointInsidePart(zonePart, hrp.Position) then
+				table.insert(list, plr)
+			end
+		end
+	end
+	return list
+end
+
+-- Reset the queue after a round finishes
+local function resetQueue(queueModel)
+	local state = QueueStates[queueModel]
+	if not state then return end
+
+	for player in pairs(state.members) do
+		broadcastPlayerQueue(player, nil)
+	end
+
+	state.members = {}
+	state.countdown = nil
+
+	local maxP = getMaxPlayers(queueModel)
+	setDisplay(queueModel, ("%d/%d\nWaiting..."):format(0, maxP))
+end
+
+-- Teleports everyone in the queue into a reserved private server
+-- Also filters out anyone who left or doesn’t pass loadout validation
+local function teleportGroup(queueModel, members)
+	local state = QueueStates[queueModel]
+	if not state then return end
+
+	local mapValue = state.selectedMap
+	if not mapValue then return end
+	
+	local placeId = mapValue.Value
+	
+	if not placeId then
+		warn(("Queue %s missing DestinationPlaceId VALUE"):format(queueModel.Name))
+		return
+	end
+
+	local playersToTeleport = {}
+	for player in pairs(members) do
+		if player
+			and player.Parent == Players
+			and hasValidLoadout(player) then
+
+			player:SetAttribute("Teleporting", true)
+
+			table.insert(playersToTeleport, player)
+		end
+	end
+	if #playersToTeleport == 0 then return end
+
+	local maxP = getMaxPlayers(queueModel)
+	local minP = getMinPlayers(queueModel, maxP)
+
+	local teleportData = {
+		fromQueue = queueModel.Name,
+		maxPlayers = maxP,
+		minPlayers = minP,
+	}
+
+	if RunService:IsStudio() then
+		warn(("[Studio] Skipping teleport for %s. Would teleport %d player(s) to placeId=%d"):format(
+			queueModel.Name,
+			#playersToTeleport,
+			placeId
+			))
+		return
+	end
+
+	local ok, err = pcall(function()
+		-- Make sure everyone ends up in the same private server
+		local accessCode = TeleportService:ReserveServer(placeId)
+
+		TeleportService:TeleportToPrivateServer(
+			placeId,
+			accessCode,
+			playersToTeleport,
+			nil,
+			teleportData
+		)
+	end)
+
+	if not ok then
+		warn(("Teleport failed for %s: %s"):format(
+			queueModel.Name,
+			tostring(err)
+			))
+
+		return false
+	end
+
+	return true
+end
+
+RE_Leave.OnServerEvent:Connect(function(player)
+	for queueModel, state in pairs(QueueStates) do
+		if state.members[player] then
+			state.members[player] = nil
+			broadcastPlayerQueue(player, nil)
+
+			local exitPart = queueModel:FindFirstChild("Exit")
+			if exitPart and exitPart:IsA("BasePart") then
+				safePivotTo(player, exitPart.CFrame + Vector3.new(0, 3, 0))
+			end
+			return
+		end
+	end
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	for _, state in pairs(QueueStates) do
+		if state.members[player] then
+			state.members[player] = nil
+		end
+	end
+end)
+
+local function isPlayerInOtherQueue(player, thisQueueModel)
+	for otherQ, otherState in pairs(QueueStates) do
+		if otherQ ~= thisQueueModel and otherState.members[player] then
+			return true
+		end
+	end
+	return false
+end
+
+-- Handles players walking into the queue zone
+-- Uses Touched but adds debounce so it doesn’t spam trigger
+-- Moves players into the queue interior once accepted
+local function hookTeleportInside(queueModel)
+	local teleportInside = queueModel:FindFirstChild("TeleportInside")
+	local insidePort = queueModel:FindFirstChild("InsidePort")
+	if not (teleportInside and teleportInside:IsA("BasePart")) then return end
+	if not (insidePort and insidePort:IsA("BasePart")) then return end
+
+	local lastTouchByChar = {}
+
+	teleportInside.Touched:Connect(function(hit)
+		local char = hit and hit.Parent
+		if not char then return end
+		local humanoid = char:FindFirstChildOfClass("Humanoid")
+		if not humanoid then return end
+
+		local plr = Players:GetPlayerFromCharacter(char)
+		if not plr then return end
+
+		local now = os.clock()
+		if lastTouchByChar[char] and (now - lastTouchByChar[char] < 0.5) then
+			return
+		end
+		lastTouchByChar[char] = now
+
+		local state = QueueStates[queueModel]
+		if not state then return end
+
+		local maxP = getMaxPlayers(queueModel)
+		
+		-- Check again in case they changed their loadout
+		if not hasValidLoadout(plr) then
+			showGeneralText:FireClient(plr, "Fill all 6 loadout slots!")
+
+			local exitPart = queueModel:FindFirstChild("Exit")
+			if exitPart and exitPart:IsA("BasePart") then
+				safePivotTo(plr, exitPart.CFrame + Vector3.new(0, 3, 0))
+			end
+
+			return
+		end
+
+		-- Don't let players join multiple queues or overfill this one
+		if countMembers(state) >= maxP or isPlayerInOtherQueue(plr, queueModel) then
+			local exitPart = queueModel:FindFirstChild("Exit")
+			if exitPart and exitPart:IsA("BasePart") then
+				safePivotTo(plr, exitPart.CFrame + Vector3.new(0, 3, 0))
+			end
+			return
+		end
+
+		if not state.members[plr] then
+			state.members[plr] = true
+			broadcastPlayerQueue(plr, queueModel.Name)
+		end
+
+		safePivotTo(plr, insidePort.CFrame + Vector3.new(0, 3, 0))
+	end)
+end
+
+for q in pairs(QueueStates) do
+	hookTeleportInside(q)
+end
+
+QueuesFolder.ChildAdded:Connect(function(child)
+	if child:IsA("Model") then
+		task.defer(function()
+			hookTeleportInside(child)
+		end)
+	end
+end)
+
+-- Main update loop (runs every 0.2 seconds instead of every frame (which is the scaninterval))
+-- This keeps everything in sync without overloading the server
+local acc = 0
+RunService.Heartbeat:Connect(function(dt)
+	acc += dt
+	if acc < scanInterval then return end
+	acc = 0
+
+	for queueModel, state in pairs(QueueStates) do
+		if not queueModel.Parent then
+			QueueStates[queueModel] = nil
+			continue
+		end
+
+		local zone = queueModel:FindFirstChild("Zone")
+		if not (zone and zone:IsA("BasePart")) then
+			continue
+		end
+
+		local maxP = getMaxPlayers(queueModel)
+		
+		if state.teleporting then
+
+			local anyoneStillHere = false
+
+			for plr in pairs(state.teleportingPlayers) do
+				if plr.Parent == Players then
+					anyoneStillHere = true
+					break
+				end
+			end
+
+			if anyoneStillHere then
+				local tpCount = 0
+
+				for _ in pairs(state.teleportingPlayers) do
+					tpCount += 1
+				end
+
+				setDisplay(
+					queueModel,
+					("%d/%d\nTeleporting...")
+						:format(
+							tpCount,
+							maxP
+						)
+				)
+
+				continue
+			end
+
+			resetQueue(queueModel)
+
+			state.teleporting = false
+			state.teleportingPlayers = {}
+
+			continue
+		end
+		
+		local minP = getMinPlayers(queueModel, maxP)
+		local defaultTime = DefaultTimeByMax[maxP] or 15
+
+		local inside = getPlayersInZone(zone)
+		local insideSet = {}
+		for _, plr in ipairs(inside) do insideSet[plr] = true end
+
+		for plr in pairs(state.members) do
+			if not insideSet[plr] or not hasValidLoadout(plr) then
+				state.members[plr] = nil
+				broadcastPlayerQueue(plr, nil)
+
+				if not hasValidLoadout(plr) then
+					showGeneralText:FireClient(plr, "Fill all 6 loadout slots!")
+
+					local exitPart = queueModel:FindFirstChild("Exit")
+					if exitPart and exitPart:IsA("BasePart") then
+						safePivotTo(plr, exitPart.CFrame + Vector3.new(0, 3, 0))
+					end
+				end
+			end
+		end
+
+		-- Add new players standing inside the zone
+		for plr in pairs(insideSet) do
+			local alreadyInOther = false
+			for otherQ, otherState in pairs(QueueStates) do
+				if otherQ ~= queueModel and otherState.members[plr] then
+					alreadyInOther = true
+					break
+				end
+			end
+			if not alreadyInOther and countMembers(state) < maxP then
+				if not state.members[plr] then
+					state.members[plr] = true
+					broadcastPlayerQueue(plr, queueModel.Name)
+				end
+			end
+		end
+
+		local current = countMembers(state)
+		
+		if state.teleporting then
+			setDisplay(queueModel,
+				("%d/%d\nTeleporting..."):format(
+					current,
+					maxP
+				)
+			)
+
+			continue
+		end
+
+		if state.countdown == nil then
+			state.countdown = defaultTime
+			state.selectedMap = pickRandomMap(queueModel)
+			setMapImage(queueModel, state.selectedMap)
+		end
+
+		-- No reason to wait the full timer if the queue is already full
+		if current >= maxP and state.countdown ~= nil and state.countdown > 5 then
+			state.countdown = 5
+		end
+
+		if state.countdown then
+			state.countdown -= scanInterval
+			-- Start the match once enough players are ready
+			if state.countdown <= 0 then
+				if countMembers(state) >= minP then
+					state.teleporting = true
+					
+					state.teleportingPlayers = {}
+
+					setDisplay(queueModel,
+						("%d/%d\nTeleporting..."):format(
+							countMembers(state),
+							maxP
+						)
+					)
+					
+					-- Remove anyone who left the queue area
+					for plr in pairs(state.members) do
+						state.teleportingPlayers[plr] = true
+					end
+
+					teleportGroup(queueModel, state.members)
+
+					continue
+					
+					-- Not enough players, reset for another round
+				else
+					state.countdown = defaultTime
+					state.selectedMap = pickRandomMap(queueModel)
+					setMapImage(queueModel, state.selectedMap)
+				end
+			end
+		end
+
+		if state.countdown == nil then
+			setDisplay(queueModel, ("%d/%d\nNeed %d to start"):format(current, maxP, minP))
+		else
+			local mapName = state.selectedMap and state.selectedMap.Name or "Unknown Map"
+
+			setDisplay(queueModel, ("%d/%d\nMap: %s\nStarting in: %ds"):format(
+				current,
+				maxP,
+				mapName,
+				math.max(0, math.ceil(state.countdown))
+				))
+		end
+	end
+end)
+
+-- Initialize every queue when the server starts
+for q in pairs(QueueStates) do
+	resetQueue(q)
+end
